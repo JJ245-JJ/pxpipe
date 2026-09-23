@@ -79,6 +79,27 @@ function wireImageBytes(msgs: any[]): number {
   return total;
 }
 
+/**
+ * Wire bytes a fixture renders to under the default ceiling. Budgets below are
+ * derived from this instead of hard-coded, because PNG size is a property of
+ * the runtime's zlib build, not of pxpipe: Homebrew Node links macOS zlib 1.2.12
+ * while official Node bundles 1.3.x, and the same slab comes out ~25% apart.
+ */
+async function renderedBytes(body: Uint8Array): Promise<number> {
+  resetSessionState();
+  const { body: out } = await transformRequest(body);
+  resetSessionState();
+  return wireImageBytes(dec(out).messages);
+}
+
+/** A budget that admits the slab and leaves the first tool group without room. */
+async function slabOnlyBudget(): Promise<number> {
+  const slab = await renderedBytes(withSlab([{ role: 'user', content: 'go' }]));
+  const both = await renderedBytes(withSlab([{ role: 'user', content: 'go' }, toolResult('t1')]));
+  expect(both).toBeGreaterThan(slab); // the fixture must leave a gap to aim into
+  return Math.floor((slab + both) / 2);
+}
+
 describe('counting what the caller already spent', () => {
   it('sees caller images at both nesting levels', () => {
     const msgs = [
@@ -122,13 +143,13 @@ describe('a group that does not fit keeps its text', () => {
   });
 
   it('keeps a tool_result as text when its pages do not fit', async () => {
-    // Measured on this fixture: the slab renders to 12,683 bytes and the
-    // tool_result group to about 6,358 more. A budget between the two admits the
-    // slab and leaves the tool group without room, which is the case worth
-    // pinning: partial admission is what must not happen.
+    // A budget between the slab and slab+tool admits the slab and leaves the
+    // tool group without room, which is the case worth pinning: partial
+    // admission is what must not happen.
+    const maxImageBytes = await slabOnlyBudget();
     const { body: out, info } = await transformRequest(
       withSlab([{ role: 'user', content: 'go' }, toolResult('t1')]),
-      { maxImageBytes: 15_000 },
+      { maxImageBytes },
     );
     expect(info.imageCount ?? 0).toBeGreaterThan(0); // the slab was admitted
     expect(info.toolResultImgs ?? 0).toBe(0); // the tool group was not
@@ -138,7 +159,7 @@ describe('a group that does not fit keeps its text', () => {
   });
 
   it('stays within the budget it was given', async () => {
-    const limit = 15_000;
+    const limit = await slabOnlyBudget();
     const { body: out } = await transformRequest(
       withSlab([{ role: 'user', content: 'go' }, toolResult('t1'), toolResult('t2')]),
       { maxImageBytes: limit },
@@ -173,8 +194,9 @@ describe('telemetry distinguishes the two ceilings', () => {
   it('reports a byte skip, not a count skip, when weight is what ran out', async () => {
     const { info } = await transformRequest(
       withSlab([{ role: 'user', content: 'go' }, toolResult('t1')]),
-      { maxImageBytes: 15_000 },
+      { maxImageBytes: await slabOnlyBudget() },
     );
+    expect(info.imageCount ?? 0).toBeGreaterThan(0); // weight ran out mid-request, not at zero
     // Five images is far under the 100-image cap, so nothing here is a count
     // problem. The two ceilings need different fixes and must not be conflated.
     expect(info.imageByteSkips ?? 0).toBeGreaterThan(0);
@@ -182,10 +204,11 @@ describe('telemetry distinguishes the two ceilings', () => {
   });
 
   it('warns before the next turn walks into the wall', async () => {
+    const slab = await renderedBytes(withSlab([{ role: 'user', content: 'go' }]));
     const { info } = await transformRequest(withSlab([{ role: 'user', content: 'go' }]), {
-      // The slab measures 12,683 bytes, so a 14,000-byte budget admits it at
-      // about 91% full: nothing is dropped this turn, and the next one will be.
-      maxImageBytes: 14_000,
+      // Admits the slab at 95% full: nothing is dropped this turn, and the
+      // next one will be.
+      maxImageBytes: Math.ceil(slab / 0.95),
     });
     expect(info.imageCount ?? 0).toBeGreaterThan(0);
     expect(info.imageBytesNearLimit).toBe(true);
